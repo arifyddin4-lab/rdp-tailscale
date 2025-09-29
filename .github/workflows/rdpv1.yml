@@ -1,0 +1,121 @@
+name: RDPV1
+on:
+  workflow_dispatch:
+    inputs:
+      ttl_minutes:
+        description: "কত মিনিট পরে RDP ইউজার অটো-ডিলিট হবে"
+        required: false
+        default: "60"
+
+env:
+  TTL_MINUTES: ${{ github.event.inputs.ttl_minutes }}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    steps:
+
+      - name: Ensure secrets present
+        shell: pwsh
+        run: |
+          if (-not $env:RDP_PASSWORD) { Write-Error "Missing secret: RDP_PASSWORD"; exit 1 }
+          if (-not $env:TAILSCALE_AUTH_KEY) { Write-Error "Missing secret: TAILSCALE_AUTH_KEY"; exit 1 }
+          Write-Host "::add-mask::$env:RDP_PASSWORD"
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User from Secret (no prints)
+        shell: pwsh
+        run: |
+          $username = "TOOLBOXLAP"
+          $plain = $env:RDP_PASSWORD
+          $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Schedule Auto-delete of RDP User
+        shell: pwsh
+        run: |
+          $username = "TOOLBOXLAP"
+          $ttl = [int]$env:TTL_MINUTES
+          if ($ttl -le 0) { Write-Error "TTL_MINUTES must be > 0"; exit 1 }
+
+          $runAt = (Get-Date).AddMinutes($ttl).ToString("HH:mm")
+
+          $taskCmd = "powershell -NoProfile -WindowStyle Hidden -Command `"Remove-LocalUser -Name '$username' -ErrorAction SilentlyContinue; schtasks /Delete /TN 'Remove-RDP-TOOLBOXLAP' /F`""
+
+          schtasks /Create /SC ONCE /ST $runAt /TN "Remove-RDP-TOOLBOXLAP" /TR $taskCmd /F | Out-Null
+          schtasks /Query /TN "Remove-RDP-TOOLBOXLAP" /Fo LIST
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          Write-Host "::add-mask::$tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          $tsIP = $env:TAILSCALE_IP
+          if (-not $tsIP) { Write-Error "No Tailscale IP available"; exit 1 }
+
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "✅ RDP reachable via Tailscale. Use your secrets to log in."
+
+      - name: Keep Runner Alive
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Write-Host "Runner active. RDP user will auto-delete in $env:TTL_MINUTES minute(s)."
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
